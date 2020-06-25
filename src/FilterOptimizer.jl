@@ -1,31 +1,52 @@
 module FilterOptimizer
 
+const debug = false
+
 using DSP
 using LinearAlgebra
 using NPZ
 using Optim
-using Plots
+using LineSearches
+if !debug
+    using Plots
+end
 using Polynomials
+using Random
 using Statistics
 
 
 function main_simple_plot()
     ensemble_size = 8
     cutoff_frac = 0.1  # [fraction of Nyquist, i.e. of fs/2]
+    num_freqs = 100
+
+    filter = make_initial_filter(ensemble_size, cutoff_frac)
+
+    # K88  Filter given from Matlab is transposed.
+    filter = [ 0.101928620359513  -0.144692907668316   0.001818686042631   0.034079418317095   0.017585080356053   0.001315214737816  -0.003444416529060  -0.001436438714533
+    -0.182345096610246   0.360756599962924  -0.147994984888741  -0.059129118196972   0.002868426988251   0.015712495777574   0.007502730016391  -0.002913799498315
+    0.325318278686291  -0.644192151825324   0.366462705585208  -0.039188548203213  -0.002501377627620   0.008040320659969   0.004771188361656  -0.001218136494786
+    0.214429240579235   0.020907800279936  -0.640407310078860   0.438171965206373  -0.001984312130525   0.000672744414457   0.000815968852531   0.000020116755318
+    0.039388771853078   0.158515140964055   0.021611283755305  -0.627238094500448   0.444963982609944  -0.001482793266190  -0.000658657133152   0.000289435629589
+    -0.028159300455806   0.079366422909548   0.158022482575611   0.012192601874105  -0.632146169468256   0.444503863315704  -0.000536386191742   0.000149049199835
+    -0.023962585339180   0.005858919704412   0.078943901425177   0.150008766716844   0.008032778760745  -0.632505199692507   0.445310958035830   0.000012891795086
+    -0.006277091297826  -0.015051750417134   0.005747354831077   0.076845015215617   0.148923596940809   0.007947473300587  -0.632293311502353   0.445417719102865];
+    filter = filter';
+    # K88 noDC
+    filter = mean(filter, dims=1) .- filter;
 
     input_vec, freq_vec = make_input(ensemble_size)
+    output_vec = apply_wallfilter(input_vec, filter)
+    plot_response(freq_vec, make_desired_response(cutoff_frac), make_response(input_vec), make_response(output_vec))
 
-    initial_filter = make_initial_filter(ensemble_size, cutoff_frac)
-    EvaluateWallFilter(initial_filter)
-
-    output_vec = apply_wallfilter(input_vec, initial_filter)
-    plot_response(freq_vec, make_response(input_vec), make_response(output_vec), ensemble_size)
+    FilterOptimizer.PlotWallFilter(FilterOptimizer.EvaluateWallFilter(filter)...)
+    filter
 end
 
 
 function main_objective()
     ensemble_size = 8
-    cutoff_frac = 0.2  # [fraction of Nyquist, i.e. of fs/2]
+    cutoff_frac = 0.1  # [fraction of Nyquist, i.e. of fs/2]
     num_freqs = 100
 
     input_vec, freq_vec = make_input(ensemble_size, num_freqs)
@@ -35,34 +56,97 @@ function main_objective()
     @show desired_response
 
     initial_filter = make_initial_filter(ensemble_size, cutoff_frac)
-    EvaluateWallFilter(initial_filter)
+    # objective = objective_autocorr
+    objective = objective_consistency
+
+    # warm up and debug
+    x = initial_filter
+    f, fout = EvaluateWallFilter(x, num_freqs)
+    output_vec = apply_wallfilter(input_vec, x)
+    output_response = make_response(output_vec)
+    loss = objective(desired_response, output_response, fout)
+    if !debug
+        PlotWallFilter(f, fout)
+    end
 
     function optim_iter(x)
+        _, fout = EvaluateWallFilter(x, num_freqs)
         output_vec = apply_wallfilter(input_vec, x)
         output_response = make_response(output_vec)
-        # plot_response(freq_vec, input_response, output_response, ensemble_size)
-        loss = loss_function(desired_response, output_response)
+        loss = objective(desired_response, output_response, fout)
     end
+
+    optim_iter(initial_filter)
 
     # Continuous, multivariate, optimization
     # Simulated Annealing, Evolutionary algo
     # CG, etc.: Compute / Auto Grad of f?
     # SPSA: black box, doesnt need gradient of f. Perturbs all params at the same time.
     # FD: black box, doesnt need gradient of f. Perturbs one param at a time.
-    result = optimize(optim_iter, copy(initial_filter), BFGS(),
-        Optim.Options(show_trace = true),
+    result = optimize(optim_iter, copy(initial_filter),
+        # LBFGS(linesearch=LineSearches.BackTracking()),
+        BFGS(linesearch=LineSearches.BackTracking()),
+        # ConjugateGradient(linesearch=LineSearches.BackTracking()),
+        # NelderMead(),
+        debug ? Optim.Options(show_trace = true, iterations = 1) : Optim.Options(show_trace = true),
         ; autodiff = :forward
         )
     @show result
 
     optimized_filter = Optim.minimizer(result)
-    show(stdout, "text/plain", optimized_filter)
+    # optimized_filter noDC
+    # optimized_filter = mean(optimized_filter, dims=1) .- optimized_filter;
     npzwrite("$(homedir())/Downloads/optimized_filter_cutoff$(cutoff_frac)_ensemble$(ensemble_size).npy", optimized_filter)
 
     output_vec = apply_wallfilter(input_vec, optimized_filter)
-    plot_response(freq_vec, input_response, make_response(output_vec), ensemble_size)
-    EvaluateWallFilter(optimized_filter)
+    if !debug
+        plot_response(freq_vec, desired_response, input_response, make_response(output_vec))
+        PlotWallFilter(EvaluateWallFilter(optimized_filter, num_freqs)...)
+    end
+
     optimized_filter
+end
+
+
+function objective_autocorr(desired_response, output_response, fout)
+    desired_mag, desired_pha = desired_response
+    output_mag, output_pha = output_response
+    e = [desired_mag .- output_mag ; desired_pha .- output_pha]
+    norm(e)
+end
+
+
+function objective_consistency(desired_response, output_response, fout)
+    # size(fout) = (num_freqs, ensemble_size_out)
+    desired_mag, desired_pha = desired_response
+    output_mag, output_pha = output_response
+    # e = desired_mag .- output_mag  # OK
+    # e = [desired_mag .- output_mag ; desired_pha .- output_pha]  # OK
+    # e = vec(abs.(fout) .- desired_mag)  # OK
+    # e = vec(std(diff(angle.(fout), dims=2), dims=2))  # NaN
+    # e = vec(std(angle.(fout), dims=2))  # NaN
+    # e = vec(diff(angle.(fout), dims=2))  # OK
+    # e = [vec(abs.(fout) .- desired_mag) ; vec(diff(angle.(fout), dims=2))]  # OK but not great filter.
+    # e = vec(angle.(fout))  # OK. Bad result with UNWRAP.
+    # e = [vec(abs.(fout) .- desired_mag) ; vec(angle.(fout))]  # OK but not great filter.
+    # e = vec(diff(diff(angle.(fout), dims=2), dims=2))  # OK
+    # e = [vec(abs.(fout) .- desired_mag) ; vec(diff(diff(angle.(fout), dims=2), dims=2))]  # NaN
+
+    # e = [desired_mag .- output_mag ; desired_pha .- output_pha ;
+    #      vec(abs.(fout) .- desired_mag) ; vec(diff(unwrap(angle.(fout), dims=1), dims=2))]  # OK
+
+    e = [vec(abs.(fout) .- desired_mag) ; vec(diff(angle.(fout), dims=2))]
+
+    # e = [desired_mag .- output_mag ; vec(angle.(fout))]
+    # e = [desired_mag .- output_mag ; vec(std(angle.(fout), dims=2))]  # NaN
+    # e = [desired_mag .- output_mag ; vec(std(diff(angle.(fout), dims=2), dims=2))]  # NaN
+    # e = abs.(fout) .- desired_mag
+    # e = [desired_mag .- output_mag ; vec(diff(abs.(fout), dims=2))]
+    # e = [desired_mag .- output_mag ; vec(diff(abs.(fout), dims=2))]  # NaN
+    # e = [desired_mag .- output_mag ; vec(diff(abs.(fout), dims=2)) ; vec(diff(angle.(fout), dims=2))]  # NaN
+    # e = [vec(desired_mag .- fout) ; vec(diff(abs.(fout), dims=2)) ; vec(diff(angle.(fout), dims=2))]
+    # println(length(e))
+    norm(e)
 end
 
 
@@ -77,23 +161,18 @@ function make_initial_filter(ensemble_size, cutoff_frac)
     # digitalfilter(responsetype, designmethod)
 
     # POLYNOMIAL REGRESSION FILTER
-    filter_order = 2
-    polynomial_regression_filter(ensemble_size, filter_order)
+    # filter_order = 1
+    # polynomial_regression_filter(ensemble_size, filter_order)
 
     # FIR 2zero FILTER
     # fir_2zero_wallfilter(ensemble_size)
 
     # RANDOM matrix
+    Random.seed!(1);
     # need randn and not rand b/c need some negative coefficients in order to get a highpass filter
     # randn(ensemble_size, ensemble_size)
-end
-
-
-function loss_function(desired_response, output_response)
-    desired_mag, desired_pha = desired_response
-    output_mag, output_pha = output_response
-    diff = [desired_mag .- output_mag ; desired_pha .- output_pha]
-    sqrt(sum(abs2, diff))
+    # rand uniform [-1, +1)
+    2*rand(ensemble_size, ensemble_size) .- 1
 end
 
 
@@ -182,62 +261,49 @@ function fir_2zero_wallfilter(ensemble_size)
 end
 
 
-function plot_response(freq_vec, input_response, output_response, ensemble_size)
+function plot_response(freq_vec, desired_response, input_response, output_response)
+    desired_mag, desired_pha = desired_response
     input_mag, input_pha = input_response
     output_mag, output_pha = output_response
 
     # plot frequency response (should attenuate lower freqs)
     # fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
-    p1 = plot(2freq_vec, [20log10.(input_mag) 20log10.(output_mag)],
-        label=["Input Ensemble" "WF'ed Ensemble"],
-        title="Autocorrelation (frequency) response of wall filter, Ens=$ensemble_size",
+    p1 = plot(2freq_vec, [20log10.(desired_mag.+1e-6) 20log10.(input_mag) 20log10.(output_mag)],
+        label=["Desired" "Input Ensemble" "WF'ed Ensemble"],
+        title="Autocorrelation (frequency) response of wall filter",
         ylabel="Autocor0 abs [log a.u.]",
         xlims=(0, 1),
         ylims=(-60, Inf),
+        lw=2,
     )
 
     # plot phase response
-    p2 = plot(2freq_vec, [input_pha output_pha],
-        label=["Input Ensemble" "WF'ed Ensemble"],
+    p2 = plot(2freq_vec, [desired_pha input_pha output_pha],
+        label=["Desired" "Input Ensemble" "WF'ed Ensemble"],
         xlabel="Frequency (0 to Nyquist) [fraction of fs/2]",
         ylabel="Autocor1 phase [radians]",
         xlims=(0, 1),
+        ylims=(-π, π),
+        lw=2,
     )
 
     # A Plot is only displayed when returned (a semicolon will suppress the return),
     # or if explicitly displayed with display(plt), gui(), or by adding show = true to your plot command.
-    display(plot(p1, p2, layout = (2, 1), legend = true))
-end
-
-
-function unwrap(v, inplace=false)
-    # currently assuming a matrix
-    unwrapped = inplace ? v : copy(v)
-    N,M = size(v)
-    for row in 1:N
-        for i in 2:M
-            d = unwrapped[row, i] - unwrapped[row, i-1]
-            if abs(d) > π
-                unwrapped[row, i] -= floor((d+π) / (2π)) * 2π
-            end
-        end
-    end
-
-    return unwrapped
+    display(plot(p1, p2, size=(800, 500), layout = (2, 1), legend = true))
 end
 
 
 """
     Func from Karl
 """
-function EvaluateWallFilter(wf, PhaseOffset=0, PhaseMultiplier=1)
+function EvaluateWallFilter(wf, num_freqs=100, PhaseOffset=0, PhaseMultiplier=1)
     # Matlab, old: Assume out (Nx1) = WF (NxM) x in (Mx1)
     # M = ensemble size, N = number of filters(output samples)
     # Assume in (1xM) x WF (MxN) = out (1xN)
     M, N = size(wf)
 
     # Assume Real
-    f = 0:0.01:1
+    f = linspace_with_endpoint(0, 1, num_freqs)
     xf = exp.(1im * π * f)
     P = length(f)
 
@@ -253,36 +319,45 @@ function EvaluateWallFilter(wf, PhaseOffset=0, PhaseMultiplier=1)
         fout[:,n] = fcoefs[:]
     end
 
+    f, fout
+end
+
+
+function PlotWallFilter(f, fout)
+    # plot mag response
     p1 = plot(f, 20log10.(abs.(fout)),
         title="Magnitude Consistency Across Wall Filter Polyphases",
         ylabel="Abs [log a.u.]",
         xlims=(0, 1),
         ylims=(-60, Inf),
+        lw=2,
     )
     # plot phase response
-    # unwrap starting from the right (Nyquist)
-    p2 = plot(f, angle.(fout),
+    p2 = plot(f, unwrap(angle.(fout .+ eps()), dims=1),
         title="Phase Consistency Across Wall Filter Polyphases",
         xlabel="Frequency (0 to Nyquist) [fraction of fs/2]",
         ylabel="Phase [radians]",
         xlims=(0, 1),
+        ylims=(-π, π),
+        lw=2,
     )
-    display(plot(p1, p2, layout = (2, 1), legend = true))
+    # plot group delay (d phase / d w)
+    p3 = plot(f[1:end-1], diff(unwrap(angle.(fout .+ eps()), dims=1), dims=1) ./ diff(f, dims=1) ./ π,
+        title="Group Delay Consistency Across Wall Filter Polyphases",
+        xlabel="Frequency (0 to Nyquist) [fraction of fs/2]",
+        ylabel="Group delay [samples]",
+        xlims=(0, 1),
+        lw=2,
+    )
+    display(plot(p1, p2, p3, size=(800, 800), layout = (3, 1), legend = true))
 end
 
 
 end # module
 
 
-# FilterOptimizer.main_simple_plot();
-FilterOptimizer.main_objective();
+# wf = FilterOptimizer.main_simple_plot();
 
-# K88 = [ 0.101928620359513  -0.144692907668316   0.001818686042631   0.034079418317095   0.017585080356053   0.001315214737816  -0.003444416529060  -0.001436438714533
-#        -0.182345096610246   0.360756599962924  -0.147994984888741  -0.059129118196972   0.002868426988251   0.015712495777574   0.007502730016391  -0.002913799498315
-#         0.325318278686291  -0.644192151825324   0.366462705585208  -0.039188548203213  -0.002501377627620   0.008040320659969   0.004771188361656  -0.001218136494786
-#         0.214429240579235   0.020907800279936  -0.640407310078860   0.438171965206373  -0.001984312130525   0.000672744414457   0.000815968852531   0.000020116755318
-#         0.039388771853078   0.158515140964055   0.021611283755305  -0.627238094500448   0.444963982609944  -0.001482793266190  -0.000658657133152   0.000289435629589
-#        -0.028159300455806   0.079366422909548   0.158022482575611   0.012192601874105  -0.632146169468256   0.444503863315704  -0.000536386191742   0.000149049199835
-#        -0.023962585339180   0.005858919704412   0.078943901425177   0.150008766716844   0.008032778760745  -0.632505199692507   0.445310958035830   0.000012891795086
-#        -0.006277091297826  -0.015051750417134   0.005747354831077   0.076845015215617   0.148923596940809   0.007947473300587  -0.632293311502353   0.445417719102865];
-# FilterOptimizer.EvaluateWallFilter(K88');
+wf = FilterOptimizer.main_objective();
+
+show(stdout, "text/plain", wf)
