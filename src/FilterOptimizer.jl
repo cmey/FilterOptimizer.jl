@@ -1,12 +1,14 @@
 module FilterOptimizer
 
 const debug = false
+const fullblown_optim = true  # false: LsqFit, true: Optim
 
 using DSP
 using LinearAlgebra
 using NPZ
 using Optim
 using LineSearches
+using LsqFit
 if !debug
     using Plots
 end
@@ -15,7 +17,7 @@ using Random
 using Statistics
 
 
-function main_simple_plot()
+function main_simple_plot(; noDC=false)
     ensemble_size = 8
     cutoff_frac = 0.1  # [fraction of Nyquist, i.e. of fs/2]
     num_freqs = 100
@@ -23,17 +25,21 @@ function main_simple_plot()
     filter = make_initial_filter(ensemble_size, cutoff_frac)
 
     # K88  Filter given from Matlab is transposed.
-    filter = [ 0.101928620359513  -0.144692907668316   0.001818686042631   0.034079418317095   0.017585080356053   0.001315214737816  -0.003444416529060  -0.001436438714533
-    -0.182345096610246   0.360756599962924  -0.147994984888741  -0.059129118196972   0.002868426988251   0.015712495777574   0.007502730016391  -0.002913799498315
-    0.325318278686291  -0.644192151825324   0.366462705585208  -0.039188548203213  -0.002501377627620   0.008040320659969   0.004771188361656  -0.001218136494786
-    0.214429240579235   0.020907800279936  -0.640407310078860   0.438171965206373  -0.001984312130525   0.000672744414457   0.000815968852531   0.000020116755318
-    0.039388771853078   0.158515140964055   0.021611283755305  -0.627238094500448   0.444963982609944  -0.001482793266190  -0.000658657133152   0.000289435629589
-    -0.028159300455806   0.079366422909548   0.158022482575611   0.012192601874105  -0.632146169468256   0.444503863315704  -0.000536386191742   0.000149049199835
-    -0.023962585339180   0.005858919704412   0.078943901425177   0.150008766716844   0.008032778760745  -0.632505199692507   0.445310958035830   0.000012891795086
-    -0.006277091297826  -0.015051750417134   0.005747354831077   0.076845015215617   0.148923596940809   0.007947473300587  -0.632293311502353   0.445417719102865];
-    filter = filter';
-    # K88 noDC
-    filter = mean(filter, dims=1) .- filter;
+    # filter = [ 0.101928620359513  -0.144692907668316   0.001818686042631   0.034079418317095   0.017585080356053   0.001315214737816  -0.003444416529060  -0.001436438714533
+    #           -0.182345096610246   0.360756599962924  -0.147994984888741  -0.059129118196972   0.002868426988251   0.015712495777574   0.007502730016391  -0.002913799498315
+    #            0.325318278686291  -0.644192151825324   0.366462705585208  -0.039188548203213  -0.002501377627620   0.008040320659969   0.004771188361656  -0.001218136494786
+    #            0.214429240579235   0.020907800279936  -0.640407310078860   0.438171965206373  -0.001984312130525   0.000672744414457   0.000815968852531   0.000020116755318
+    #            0.039388771853078   0.158515140964055   0.021611283755305  -0.627238094500448   0.444963982609944  -0.001482793266190  -0.000658657133152   0.000289435629589
+    #           -0.028159300455806   0.079366422909548   0.158022482575611   0.012192601874105  -0.632146169468256   0.444503863315704  -0.000536386191742   0.000149049199835
+    #           -0.023962585339180   0.005858919704412   0.078943901425177   0.150008766716844   0.008032778760745  -0.632505199692507   0.445310958035830   0.000012891795086
+    #           -0.006277091297826  -0.015051750417134   0.005747354831077   0.076845015215617   0.148923596940809   0.007947473300587  -0.632293311502353   0.445417719102865];
+    # filter = filter';
+
+    if noDC
+        filter = mean(filter, dims=1) .- filter;
+    end
+
+    npzwrite("$(homedir())/Downloads/optimized_filter_cutoff$(cutoff_frac)_ensemble$(ensemble_size).npy", filter)
 
     input_vec, freq_vec = make_input(ensemble_size)
     output_vec = apply_wallfilter(input_vec, filter)
@@ -44,9 +50,9 @@ function main_simple_plot()
 end
 
 
-function main_objective()
+function main_objective(; noDC=false)
     ensemble_size = 8
-    cutoff_frac = 0.1  # [fraction of Nyquist, i.e. of fs/2]
+    cutoff_frac = 0.10  # [fraction of Nyquist, i.e. of fs/2]
     num_freqs = 100
 
     input_vec, freq_vec = make_input(ensemble_size, num_freqs)
@@ -73,38 +79,117 @@ function main_objective()
         _, fout = EvaluateWallFilter(x, num_freqs)
         output_vec = apply_wallfilter(input_vec, x)
         output_response = make_response(output_vec)
-        loss = objective(desired_response, output_response, fout)
+        if fullblown_optim
+            loss = objective(desired_response, output_response, fout)
+            return loss
+        else
+            # c = vec(output_response[1] .* exp.(1im .* output_response[2]))
+            # return vec([real.(c) ; imag.(c)])
+            return [vec(real.(fout)) ; vec(imag.(fout))]
+        end
     end
 
     optim_iter(initial_filter)
 
-    # Continuous, multivariate, optimization
-    # Simulated Annealing, Evolutionary algo
-    # CG, etc.: Compute / Auto Grad of f?
-    # SPSA: black box, doesnt need gradient of f. Perturbs all params at the same time.
-    # FD: black box, doesnt need gradient of f. Perturbs one param at a time.
-    result = optimize(optim_iter, copy(initial_filter),
-        # LBFGS(linesearch=LineSearches.BackTracking()),
-        BFGS(linesearch=LineSearches.BackTracking()),
-        # ConjugateGradient(linesearch=LineSearches.BackTracking()),
-        # NelderMead(),
-        debug ? Optim.Options(show_trace = true, iterations = 1) : Optim.Options(show_trace = true),
-        ; autodiff = :forward
-        )
-    @show result
+    if fullblown_optim
+        # Continuous, multivariate, optimization
+        # Simulated Annealing, Evolutionary algo
+        # CG, etc.: Compute / Auto Grad of f?
+        # SPSA: black box, doesnt need gradient of f. Perturbs all params at the same time.
+        # FD: black box, doesnt need gradient of f. Perturbs one param at a time.
+        result = optimize(optim_iter, copy(initial_filter),
+            # LBFGS(linesearch=LineSearches.BackTracking()),
+            BFGS(linesearch=LineSearches.BackTracking()),
+            # ConjugateGradient(linesearch=LineSearches.BackTracking()),
+            # NelderMead(),
+            debug ? Optim.Options(show_trace = true, iterations = 1) : Optim.Options(show_trace = true),
+            ; autodiff = :forward
+            )
+        @show result
 
-    optimized_filter = Optim.minimizer(result)
-    # optimized_filter noDC
-    # optimized_filter = mean(optimized_filter, dims=1) .- optimized_filter;
+        optimized_filter = Optim.minimizer(result)
+    else
+        # t: array of independent variable
+        # p: array of model parameters
+        model(t, p) = optim_iter(reshape(p, size(initial_filter)))
+        tdata = vec(input_vec)
+        c = vec(desired_response[1] .* exp.(1im .* desired_response[2]))
+        c = repeat(c, ensemble_size)
+        ydata = [vec(real.(c)) ; vec(imag.(c))]
+        p0 = vec(initial_filter)
+        fit = curve_fit(model, tdata, ydata, p0)
+        optimized_filter = reshape(fit.param, size(initial_filter))
+    end
+
+    if noDC
+        optimized_filter = mean(optimized_filter, dims=1) .- optimized_filter;
+    end
+
     npzwrite("$(homedir())/Downloads/optimized_filter_cutoff$(cutoff_frac)_ensemble$(ensemble_size).npy", optimized_filter)
 
     output_vec = apply_wallfilter(input_vec, optimized_filter)
     if !debug
-        plot_response(freq_vec, desired_response, input_response, make_response(output_vec))
         PlotWallFilter(EvaluateWallFilter(optimized_filter, num_freqs)...)
+        plot_response(freq_vec, desired_response, input_response, make_response(output_vec))
     end
 
     optimized_filter
+end
+
+
+function make_from_iir_to_matrix(ensemble_size, cutoff_frac)
+    responsetype = Highpass(cutoff_frac)
+    n = 2  # poles
+    rp = 0.5  # [dB] ripple in the passband
+    rs = 30  # [dB] stopband attentuation
+    # designmethod = Elliptic(n, rp, rs)  # n pole elliptic (Cauer) filter with rp dB ripple in the passband and rs dB attentuation in the stopband
+    designmethod = Chebyshev1(n, rp)  # ripple in passband (no ripple in stopband)
+    # designmethod = Chebyshev2(n, rp)  # ripple in stopband (no ripple in passband)
+
+    filter = digitalfilter(responsetype, designmethod)
+    @show filter
+    filter = convert(Biquad, filter)
+    # DSP.Filters.Biquad(b0, b1, b2, a1, a2) form:
+    # H(z) = (b0 +b1z^−1 +b2z^−2) / (1 +a1z^−1 +a2z^−2)
+
+    display(plot(20log10.(abs.(freqz(filter)))))
+    display(plot(abs.(phasez(filter))))
+
+    # Put in form: Edward S. Chornoboy Lincoln Lab MIT Technical Report 828, 31 December 1990
+    # H(z) = (α0 +α1z^-1 +α2z^-2) / (1 + β1z^-1 + β2z^-2)
+    # by association:
+    α0 = filter.b0
+    α1 = filter.b1
+    α2 = filter.b2
+    β1 = filter.a1
+    β2 = filter.a2
+
+    A = [α1-α0*β1
+         α2-α0*β2]
+    B = [-β1  -β2
+           1    0]
+    C = [  1
+           0]
+
+    F = zeros(ensemble_size, size(A, 1))
+    for n in 1:ensemble_size
+        F[n, :] = A' * B^(n-1)
+    end
+
+    G = zeros(ensemble_size, ensemble_size)
+    for n in 1:ensemble_size
+        G[n,n] = α0
+    end
+    for irow in 1:ensemble_size
+        for icol in 1:irow-1
+            G[irow,icol] = A' * B^(irow-icol-1) * C
+        end
+    end
+
+    Pf = F * (F' * F)^-1 * F'
+
+    filter = (I - Pf) * G
+    filter'
 end
 
 
@@ -173,6 +258,9 @@ function make_initial_filter(ensemble_size, cutoff_frac)
     # randn(ensemble_size, ensemble_size)
     # rand uniform [-1, +1)
     2*rand(ensemble_size, ensemble_size) .- 1
+
+    # IIR
+    make_from_iir_to_matrix(ensemble_size, cutoff_frac)
 end
 
 
@@ -223,7 +311,7 @@ function autocorrelation(data; lag=0)
     @assert (lag >= 0) "autocorrelation lag must be positive (currently $lag)"
     ens = size(data)[2]
     @assert (ens >= 2 * lag) "autocorrelation requires an ensemble of at least size $(lag*2) (currently $ens)"
-    mean(data[:, (1+lag):end] .* conj(circshift(data, (0, lag))[:, (1+lag:end)]), dims=2)
+    mean(data[:, 1+lag:end] .* conj(circshift(data, (0, lag))[:, 1+lag:end]), dims=2)
 end
 
 
@@ -338,7 +426,7 @@ function PlotWallFilter(f, fout)
         xlabel="Frequency (0 to Nyquist) [fraction of fs/2]",
         ylabel="Phase [radians]",
         xlims=(0, 1),
-        ylims=(-π, π),
+        ylims=(-π*1.1, π*1.1),
         lw=2,
     )
     # plot group delay (d phase / d w)
@@ -356,8 +444,8 @@ end
 end # module
 
 
-# wf = FilterOptimizer.main_simple_plot();
+wf = FilterOptimizer.main_simple_plot(noDC=true);
 
-wf = FilterOptimizer.main_objective();
+# wf = FilterOptimizer.main_objective(noDC=true);
 
 show(stdout, "text/plain", wf)
