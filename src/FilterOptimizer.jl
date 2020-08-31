@@ -13,13 +13,13 @@ if !debug
     using Plots
 end
 using Polynomials
+using Printf
 using Random
 using Statistics
 
 
-function main_simple_plot(; noDC=false)
-    ensemble_size = 8
-    cutoff_frac = 0.1  # [fraction of Nyquist, i.e. of fs/2]
+function main_simple_plot(; ensemble_size=8, cutoff_frac=0.05, noDC=false, killOutputs=1:0)
+    # cutoff_frac = 0.05  # [fraction of Nyquist, i.e. of fs/2]
     num_freqs = 100
 
     filter = make_initial_filter(ensemble_size, cutoff_frac)
@@ -36,10 +36,15 @@ function main_simple_plot(; noDC=false)
     # filter = filter';
 
     if noDC
-        filter = mean(filter, dims=1) .- filter;
+        filter = -mean(filter, dims=1) .+ filter;
     end
 
-    npzwrite("$(homedir())/Downloads/optimized_filter_cutoff$(cutoff_frac)_ensemble$(ensemble_size).npy", filter)
+    filter[:, killOutputs] .= 0
+
+    # path = "$(homedir())/Downloads/"
+    path = "$(homedir())/Code/ButterflyNetwork/software/imaging/imaging/recon/doppler/wallfilter/data/"
+    filepath = path * "optimized_filter_cutoff$(@sprintf("%.2f", cutoff_frac))_ensemble$(ensemble_size).npy"
+    npzwrite(filepath, filter)
 
     input_vec, freq_vec = make_input(ensemble_size)
     output_vec = apply_wallfilter(input_vec, filter)
@@ -141,10 +146,10 @@ function make_from_iir_to_matrix(ensemble_size, cutoff_frac)
     responsetype = Highpass(cutoff_frac)
     n = 2  # poles
     rp = 0.5  # [dB] ripple in the passband
-    rs = 30  # [dB] stopband attentuation
+    rs = 60  # [dB] stopband attentuation
+    # designmethod = Chebyshev1(n, rp)  # ripple in passband (no ripple in stopband)
+    designmethod = Chebyshev2(n, rs)  # ripple in stopband (no ripple in passband)
     # designmethod = Elliptic(n, rp, rs)  # n pole elliptic (Cauer) filter with rp dB ripple in the passband and rs dB attentuation in the stopband
-    designmethod = Chebyshev1(n, rp)  # ripple in passband (no ripple in stopband)
-    # designmethod = Chebyshev2(n, rp)  # ripple in stopband (no ripple in passband)
 
     filter = digitalfilter(responsetype, designmethod)
     @show filter
@@ -152,8 +157,8 @@ function make_from_iir_to_matrix(ensemble_size, cutoff_frac)
     # DSP.Filters.Biquad(b0, b1, b2, a1, a2) form:
     # H(z) = (b0 +b1z^−1 +b2z^−2) / (1 +a1z^−1 +a2z^−2)
 
-    display(plot(20log10.(abs.(freqz(filter)))))
-    display(plot(abs.(phasez(filter))))
+    display(plot(20log10.(abs.(freqz(filter))), title="20log10.(abs.(freqz(filter)))"))
+    display(plot(abs.(phasez(filter)), title="abs.(phasez(filter))"))
 
     # Put in form: Edward S. Chornoboy Lincoln Lab MIT Technical Report 828, 31 December 1990
     # H(z) = (α0 +α1z^-1 +α2z^-2) / (1 + β1z^-1 + β2z^-2)
@@ -361,7 +366,7 @@ function plot_response(freq_vec, desired_response, input_response, output_respon
         title="Autocorrelation (frequency) response of wall filter",
         ylabel="Autocor0 abs [log a.u.]",
         xlims=(0, 1),
-        ylims=(-60, Inf),
+        ylims=(-100, Inf),
         lw=2,
     )
 
@@ -417,11 +422,12 @@ function PlotWallFilter(f, fout)
         title="Magnitude Consistency Across Wall Filter Polyphases",
         ylabel="Abs [log a.u.]",
         xlims=(0, 1),
-        ylims=(-60, Inf),
+        ylims=(-80, Inf),
         lw=2,
     )
     # plot phase response
-    p2 = plot(f, unwrap(angle.(fout .+ eps()), dims=1),
+    uwpha = reverse(unwrap(reverse(angle.(fout .+ eps()), dims=1), dims=1), dims=1)
+    p2 = plot(f, uwpha,
         title="Phase Consistency Across Wall Filter Polyphases",
         xlabel="Frequency (0 to Nyquist) [fraction of fs/2]",
         ylabel="Phase [radians]",
@@ -430,11 +436,12 @@ function PlotWallFilter(f, fout)
         lw=2,
     )
     # plot group delay (d phase / d w)
-    p3 = plot(f[1:end-1], diff(unwrap(angle.(fout .+ eps()), dims=1), dims=1) ./ diff(f, dims=1) ./ π,
+    p3 = plot(f[1:end-1], diff(uwpha, dims=1) ./ diff(f, dims=1) ./ π,
         title="Group Delay Consistency Across Wall Filter Polyphases",
         xlabel="Frequency (0 to Nyquist) [fraction of fs/2]",
         ylabel="Group delay [samples]",
         xlims=(0, 1),
+        ylims=(-2, 2),
         lw=2,
     )
     display(plot(p1, p2, p3, size=(800, 800), layout = (3, 1), legend = true))
@@ -444,7 +451,19 @@ end
 end # module
 
 
-wf = FilterOptimizer.main_simple_plot(noDC=true);
+# wf = FilterOptimizer.main_simple_plot(noDC=true, killOutputs=1:0);
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=8, cutoff_frac=0.05, noDC=true, killOutputs=[1, 2, 7, 8]);
+
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=8, cutoff_frac=0.02, noDC=true, killOutputs=[1, 2, 3]);  # 0.05 in Bfly
+wf = FilterOptimizer.main_simple_plot(ensemble_size=8, cutoff_frac=0.03, noDC=true, killOutputs=[1, 2, 3]);
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=8, cutoff_frac=0.04, noDC=true, killOutputs=[1, 2, 3]);
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=10, cutoff_frac=0.04, noDC=true, killOutputs=[1, 2, 3]);
+
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=8, cutoff_frac=0.03, noDC=false, killOutputs=[1, 2, 3]);
+
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=10, cutoff_frac=0.05, noDC=true, killOutputs=[1, 2, 8, 9, 10]);
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=10, cutoff_frac=0.05, noDC=true, killOutputs=[1, 2, 8, 9, 10]);
+# wf = FilterOptimizer.main_simple_plot(ensemble_size=12, cutoff_frac=0.50, noDC=true, killOutputs=[1, 2, 10, 11, 12]);
 
 # wf = FilterOptimizer.main_objective(noDC=true);
 
